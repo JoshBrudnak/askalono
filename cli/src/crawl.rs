@@ -27,10 +27,12 @@ pub fn crawl(
     follow_links: bool,
     glob: Option<&str>,
 ) -> Result<(), Error> {
+    use std::sync::Arc;
     use ignore::types::TypesBuilder;
-    use ignore::WalkBuilder;
+    use ignore::{WalkBuilder, WalkState};
 
     let store = load_store(cache_filename)?;
+    let lock = Arc::new(store);
 
     let mut types_builder = TypesBuilder::new();
     if let Some(globstr) = glob {
@@ -45,34 +47,42 @@ pub fn crawl(
     WalkBuilder::new(directory)
         .types(matcher)
         .follow_links(follow_links)
-        .build() // TODO: build_parallel? see if it's faster overall, or if it just chokes the ID threads
-        .filter_map(|e| match e.is_ok() {
-            true => Some(e),
-            false => {
-                eprintln!("{}", e.unwrap_err());
-                None
-            }
-        })
-        .filter(|e| match *e {
-            Ok(ref entry) => !entry.metadata().unwrap().is_dir(),
-            Err(_) => false,
-        })
-        .for_each(|e| {
-            let entry = e.unwrap();
-            let path = entry.path();
-            println!("{}", path.display());
+        .build_parallel()
+        .run(|| {
+            let local_store = lock.clone();
+            Box::new(move |result| {
+                if !result.is_ok() {
+                    eprintln!("{}", result.unwrap_err());
+                    return WalkState::Skip;
+                }
 
-            if let Ok(content) = read_to_string(path) {
-                let data = TextData::new(&content);
-                match identify_data(&store, &data, false, false) {
-                    Ok(res) => {
-                        print!("{}", res);
-                    },
-                    Err(err) => {
-                        eprintln!("Error: {}", err);
-                    },
-                };
-            }
+                let entry = result.unwrap();
+                let metadata = entry.metadata();
+                if !metadata.is_ok() {
+                    eprintln!("{}", metadata.unwrap_err());
+                    return WalkState::Skip;
+                }
+
+                if metadata.unwrap().is_dir() {
+                    return WalkState::Continue;
+                }
+
+                let path = entry.path();
+
+                if let Ok(content) = read_to_string(path) {
+                    let data = TextData::new(&content);
+                    match identify_data(&local_store, &data, false, false) {
+                        Ok(res) => {
+                            print!("{}\n{}", path.display(), res);
+                        },
+                        Err(err) => {
+                            eprintln!("{}\nError: {}", path.display(), err);
+                        },
+                    };
+                }
+
+                WalkState::Continue
+            })
         });
 
     Ok(())
